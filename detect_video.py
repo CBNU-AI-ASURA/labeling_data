@@ -22,22 +22,6 @@ def process_video_and_map(args):
 
     video_path, csv_dir, morpheme_dir, output_dir = args
     try:
-        # MediaPipe Pose와 Hands 초기화
-        mp_hands = mp.solutions.hands
-        pose = mp.solutions.pose.Pose(
-            model_complexity=1,
-            enable_segmentation=False,
-            smooth_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
-        hands = mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
-
         # 비디오 처리
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -59,8 +43,8 @@ def process_video_and_map(args):
 
                 frame_num += 1
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pose_result = pose.process(rgb_frame)
-                hands_result = hands.process(rgb_frame)
+                pose_result = pose.process(rgb_frame)  # 전역 pose 객체 사용
+                hands_result = hands.process(rgb_frame)  # 전역 hands 객체 사용
 
                 if pose_result.pose_landmarks:
                     for idx, landmark in enumerate(pose_result.pose_landmarks.landmark):
@@ -76,8 +60,7 @@ def process_video_and_map(args):
         cap.release()
 
         # Morpheme 매핑
-        # ex) NIA_SL_SEN0001_REAL01_D_morpheme.json
-        video_basename = os.path.basename(video_path).split('.')[0] # NIA_SL_SEN0001_REAL01_D_morpheme
+        video_basename = os.path.basename(video_path).split('.')[0]
         participant_num = video_basename.split('_')[3][-2:]
         morpheme_file = os.path.join(morpheme_dir, participant_num, f"{video_basename}_morpheme.json")
 
@@ -113,44 +96,182 @@ def process_video_and_map(args):
         print(f"Error processing {video_path}: {e}", file=sys.stderr)
 
 
-if __name__ == '__main__':
-    
-    process_num = '01'
-
-    video_root = 'raw/'
-    csv_root = 'landmarks_csv/'
-    output_root = 'labeled_csv/'
-    videos_dir = os.path.join(video_root, process_num)
-    csv_dir = os.path.join(csv_root, process_num)
-    output_dir = os.path.join(output_root, process_num)
-    os.makedirs(csv_dir, exist_ok=True)
-    os.makedirs(output_dir, exist_ok=True)
-
-    morpheme_dir = 'morpheme/'
-
-    video_files = [f for f in os.listdir(videos_dir) if f.endswith('.mp4')]
-
-    processed_files = {
-        f.split('_')[1].split('.')[0]
-        for f in os.listdir(output_dir)
-        if f.startswith('labeled_') and f.endswith('.csv')
+def setup_directories(process_num):
+    base_dirs = {
+        'video_root': 'raw/',
+        'csv_root': 'landmarks_csv/',
+        'output_root': 'labeled_csv/'
     }
+    paths = {
+        'videos_dir': os.path.join(base_dirs['video_root'], process_num),
+        'csv_dir': os.path.join(base_dirs['csv_root'], process_num),
+        'output_dir': os.path.join(base_dirs['output_root'], process_num)
+    }
+
+    for key, path in paths.items():
+        if key != 'videos_dir':  # 입력 디렉토리는 생성하지 않음
+            os.makedirs(path, exist_ok=True)
+
+    return paths
+
+
+
+def load_incomplete_files(file_path):
+    """
+    불완전한 파일 목록 로드.
+    
+    Parameters:
+        file_path (str): 파일 목록 경로.
+
+    Returns:
+        set: 파일이 존재하면 해당 파일 목록을 반환, 존재하지 않으면 빈 세트를 반환.
+    """
+    if not os.path.exists(file_path):
+        print(f"Warning: {file_path} does not exist. Processing all files instead.")
+        return set()  # 빈 세트 반환해 전체 비디오 파일 처리 가능
+    
+    with open(file_path, 'r') as f:
+        return {
+            os.path.basename(line.strip()).replace('landmarks_', '').replace('.csv', '.mp4') for line in f
+        }
+
+
+def create_args_list(videos_dir, csv_dir, morpheme_dir, output_dir, incomplete_files):
+    """
+    처리할 파일 목록 생성.
+
+    Parameters:
+        videos_dir (str): 입력 비디오 디렉토리.
+        csv_dir (str): 추출된 CSV 저장 디렉토리.
+        morpheme_dir (str): Morpheme JSON 디렉토리.
+        output_dir (str): 라벨링된 CSV 저장 디렉토리.
+        incomplete_files (set): 다시 처리할 파일 목록.
+
+    Returns:
+        list: 처리할 작업 목록.
+    """
+    video_files = [f for f in os.listdir(videos_dir) if f.endswith('.mp4')]
+    if not incomplete_files:  # 불완전 파일 목록이 비어 있으면 모든 파일 처리
+        print("No incomplete files provided. Processing all available video files.")
+        incomplete_files = set(video_files)
 
     args_list = [
         (os.path.join(videos_dir, video), csv_dir, morpheme_dir, output_dir)
         for video in video_files
-        if video.split('.')[0] not in processed_files
+        if video in incomplete_files
     ]
 
-    total = len(args_list)
-    print(f"Processing {total} / {len(video_files)} videos")
+    print(f"Total matching files: {len(args_list)}")
+    return args_list
 
-    try:
-        with Pool(processes=20) as pool:
-            for _ in tqdm(pool.imap_unordered(process_video_and_map, args_list), total=total, desc='Process videos'):
-                pass
-    except KeyboardInterrupt:
-        print("KeyboardInterrupt detected, terminating pool...")
-        pool.terminate()
-        pool.join()
-        sys.exit(1)
+
+def init_mediapipe():
+    """
+    각 프로세스가 Mediapipe 객체를 독립적으로 초기화하도록 설정.
+    """
+    global pose, hands
+    pose = mp.solutions.pose.Pose(
+        model_complexity=1,
+        enable_segmentation=False,
+        smooth_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
+    hands = mp.solutions.hands.Hands(
+        static_image_mode=False,
+        max_num_hands=2,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
+
+def load_incomplete_files(file_path):
+    """
+    불완전한 파일 목록을 선택적으로 로드.
+
+    Parameters:
+        file_path (str): 파일 목록 경로.
+
+    Returns:
+        list: 선택된 파일 목록.
+    """
+    if not os.path.exists(file_path):
+        print(f"Warning: {file_path} does not exist.")
+        return []
+
+    # 파일 목록 읽기
+    with open(file_path, 'r') as f:
+        all_files = [os.path.basename(line.strip()) for line in f]
+
+    # 선택적으로 파일 선택
+    print("Incomplete files:")
+    for idx, file in enumerate(all_files, start=1):
+        print(f"{idx}. {file}")
+
+    print("\nOptions:")
+    print("1. Select specific files by index (comma-separated, e.g., 1,3,5)")
+    print("2. Select all files")
+    print("3. Cancel and exit")
+
+    while True:
+        choice = input("Enter your choice: ").strip()
+        if choice == '1':
+            selected_indices = input("Enter indices of files to process: ").strip()
+            try:
+                selected_indices = [int(idx) for idx in selected_indices.split(',')]
+                selected_files = [all_files[idx - 1] for idx in selected_indices]
+                print(f"Selected files: {selected_files}")
+                return selected_files
+            except (ValueError, IndexError):
+                print("Invalid input. Please enter valid indices.")
+        elif choice == '2':
+            print("Processing all files.")
+            return all_files
+        elif choice == '3':
+            print("Exiting without processing.")
+            return []
+        else:
+            print("Invalid choice. Please select 1, 2, or 3.")
+
+if __name__ == '__main__':
+    while True:
+        process_num = input("Enter process_num to process (or 'exit' to quit): ").strip()
+        if process_num.lower() == 'exit':
+            print("Exiting...")
+            break
+
+        incomplete_files_path = f'incomplete_files_{process_num}.txt'
+        morpheme_dir = 'morpheme/'
+
+        print(f"Starting processing for process_num: {process_num}")
+
+        # 디렉토리 설정
+        paths = setup_directories(process_num)
+        videos_dir = paths['videos_dir']
+        csv_dir = paths['csv_dir']
+        output_dir = paths['output_dir']
+
+        # 불완전 파일 목록 로드 (없으면 모든 파일 처리)
+        incomplete_files = load_incomplete_files(incomplete_files_path)
+
+        # 처리할 작업 목록 생성
+        args_list = create_args_list(videos_dir, csv_dir, morpheme_dir, output_dir, incomplete_files)
+
+        total = len(args_list)
+        print(f"Processing {total} videos for process_num {process_num}")
+
+        if total == 0:
+            print(f"No videos to process for process_num {process_num}. Skipping...")
+            continue
+
+        # 멀티프로세싱 작업 시작
+        try:
+            with Pool(processes=10, initializer=init_mediapipe) as pool:
+                for _ in tqdm(pool.imap_unordered(process_video_and_map, args_list), total=total, desc=f'Processing {process_num}'):
+                    pass
+        except KeyboardInterrupt:
+            print(f"KeyboardInterrupt detected for process_num {process_num}, terminating pool...")
+            pool.terminate()
+            pool.join()
+            break
+
+        print(f"Completed processing for process_num: {process_num}.")
